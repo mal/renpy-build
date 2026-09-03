@@ -1,4 +1,5 @@
 import collections
+import concurrent.futures
 import gzip
 import hashlib
 import os
@@ -182,32 +183,6 @@ def make_tar(iface, fn, source_dirs):
     tf.close()
 
 
-def make_tree(src, dest):
-    src = plat.path(src)
-    dest = plat.path(dest)
-
-    def ignore(dir, files):
-        rv = []
-
-        for basename in files:
-            fn = os.path.join(dir, basename)
-            relfn = os.path.relpath(fn, src)
-
-            ignore = False
-
-            if blocklist.match(relfn):
-                ignore = True
-            if keeplist.match(relfn):
-                ignore = False
-
-            if ignore:
-                rv.append(basename)
-
-        return rv
-
-    shutil.copytree(src, dest, ignore=ignore)
-
-
 def copy_into(src, dest):
     """
     Copies all files from `src` into `dest`, creating
@@ -230,6 +205,65 @@ def copy_into(src, dest):
         return
 
     shutil.copy2(src, dest)
+
+
+def make_assets_tree(src, dst):
+    src = plat.path(src)
+    dst = plat.path(dst)
+
+    def copy(pair):
+        old, new = pair
+
+        if old.endswith(".gz"):
+            # AAPT unavoidably gunzips files with a .gz extension.
+            # To prevent this we temporarily double gzip such files,
+            # leaving AAPT to unpack them back into the original
+            # location. /o\
+            with open(old, "rb") as r, gzip.open(f'{new}.gz', "wb") as w:
+                shutil.copyfileobj(r, w)
+
+        else:
+            shutil.copy2(old, new)
+
+    def walk(old, new):
+        cache = {old: new}
+
+        os.mkdir(new)
+
+        for old_stem, dirnames, filenames in os.walk(old, topdown=True):
+            new_stem = cache[old_stem]
+            keep = []
+
+            for name in dirnames:
+                old_path = os.path.join(old_stem, name)
+                rel = os.path.relpath(old_path, old)
+
+                if blocklist.match(rel) and not keeplist.match(rel):
+                    continue
+
+                keep.append(name)
+
+                new_path = os.path.join(new_stem, "x-" + name)
+                os.mkdir(new_path)
+
+                cache[old_path] = new_path
+
+            dirnames[:] = keep
+
+            for name in filenames:
+                old_path = os.path.join(old_stem, name)
+                rel = os.path.relpath(old_path, old)
+
+                if blocklist.match(rel) and not keeplist.match(rel):
+                    continue
+
+                new_path = os.path.join(new_stem, "x-" + name)
+
+                yield old_path, new_path
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        for _ in executor.map(copy, walk(src, dst)):
+            pass
 
 
 MAX_SIZE = 1000000000
@@ -585,44 +619,12 @@ def build(
     big_bundle = bundle and size_tree(assets_dir) > 50 * 1024 * 1024
 
     def make_assets():
-
         if big_bundle:
             os.mkdir(assets)
             make_bundle_tree(assets_dir)
 
         else:
-            make_tree(assets_dir, assets)
-
-            # Ren'Py uses a lot of names that don't work as assets. Auto-rename
-            # them.
-            for dirpath, dirnames, filenames in os.walk(assets, topdown=False):
-                # Sort names longest to shortest to ensure that adding the "x-"
-                # prefix will not overwrite an asset before it has been moved.
-                names = sorted(dirnames + filenames, key=len, reverse=True)
-
-                for fn in names:
-                    if fn[0] == ".":
-                        continue
-
-                    old = os.path.join(dirpath, fn)
-                    new = os.path.join(dirpath, "x-" + fn)
-
-                    plat.rename(old, new)
-
-                    if new[-3:] != ".gz":
-                        continue
-
-                    # AAPT unavoidably gunzips files with a .gz extension.
-                    # To prevent this we temporarily double gzip such files,
-                    # leaving AAPT to unpack them back into the original
-                    # location. /o\
-
-                    old, new = new, new + ".gz"
-
-                    with open(old, "rb") as src, gzip.open(new, "wb") as out:
-                        shutil.copyfileobj(src, out)
-
-                    os.unlink(old)
+            make_assets_tree(assets_dir, assets)
 
     iface.background(make_assets)
 
